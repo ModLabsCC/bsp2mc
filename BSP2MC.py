@@ -598,135 +598,7 @@ def collect_entities(bsp, voxels):
 
 
 
-RELEVANT_INPUTS = {"open", "close", "enable", "disable"}
-
-
-
-def _next_output_names(ent, input_name, opens):
-    cls = ent["classname"]
-    inp = input_name.lower()
-    if cls == "logic_relay":
-        return {"ontrigger"}
-    if cls == "func_instance_io_proxy":
-        return {inp}
-    if cls == "math_counter":
-        if inp == "add":
-            return {"onhitmax"}
-        if inp == "subtract":
-            return {"onchangedfrommax"}
-        return set()
-    if cls == "logic_branch":
-        return {"ontrue"} if opens else {"onfalse"}
-    return set()
-
-
-def resolve_io(bsp, entity_results):
-    vmf = bsp.ents
-
-    by_targetname = defaultdict(list)
-    for ent in vmf.entities:
-        if "targetname" in ent:
-            by_targetname[ent["targetname"]].append(ent)
-
-    role_by_targetname = {}
-    cells_by_targetname = {}
-    for ent, res in entity_results:
-        if res.io_role in ("door", "fizzler", "faithplate"):
-            for tn in res.targetnames:
-                role_by_targetname[tn] = res.io_role
-                cells_by_targetname[tn] = res.io_cells
-
-    edges = []  # (button_res, opens: bool, cell_group, role)
-    button_results = [(e, r) for e, r in entity_results if r.io_role == "button"]
-
-    for button_ent, button_res in button_results:
-        for start_output, opens in (("onpressed", True), ("onunpressed", False)):
-            seen = set()
-            queue = deque()
-            for out in button_ent.outputs:
-                if out.output.lower() == start_output:
-                    queue.append((out.target, out.input))
-            while queue:
-                target_name, input_name = queue.popleft()
-                key = (target_name, input_name.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                if target_name in role_by_targetname and input_name.lower() in RELEVANT_INPUTS:
-                    edges.append((button_res, opens, cells_by_targetname[target_name],
-                                   role_by_targetname[target_name]))
-                    continue
-                for target_ent in by_targetname.get(target_name, []):
-                    wanted_outputs = _next_output_names(target_ent, input_name, opens)
-                    if not wanted_outputs:
-                        continue
-                    for out in target_ent.outputs:
-                        if out.output.lower() in wanted_outputs:
-                            queue.append((out.target, out.input))
-    return edges
-
-
-def antline_path(a, b):
-    ax, ay, az = a
-    bx, by, bz = b
-    cells = []
-    x, z = ax, az
-    while x != bx:
-        x += 1 if bx > x else -1
-        cells.append((x, ay, z))
-    while z != bz:
-        z += 1 if bz > z else -1
-        cells.append((x, ay, z))
-    if cells and cells[-1] == (bx, ay, bz):
-        cells.pop()
-    return cells
-
-
-def _closest_pair(cells_a, cells_b):
-    best, best_dist = None, None
-    for a in cells_a:
-        for b in cells_b:
-            d = abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
-            if best_dist is None or d < best_dist:
-                best, best_dist = (a, b), d
-    return best
-
-
-def generate_antlines(entity_results, io_edges):
-    placements = []
-    seen_pairs = set()
-
-    for button_res, opens, cell_group, role in io_edges:
-        if not opens:
-            continue  # one trace per button->target pair is enough
-        a, b = _closest_pair(
-            [c[0] for c in button_res.io_cells], [c[0] for c in cell_group]
-        )
-        key = (a, b)
-        if key in seen_pairs:
-            continue
-        seen_pairs.add(key)
-        for cell in antline_path(a, b):
-            placements.append(Placement(cell, f"{NS}:antline"))
-
-    button_results = [r for _, r in entity_results if r.io_role == "button"]
-    indicator_results = [r for _, r in entity_results if r.io_role == "indicator"]
-    for button_res in button_results:
-        for indicator_res in indicator_results:
-            a, b = _closest_pair(
-                [c[0] for c in button_res.io_cells], [c[0] for c in indicator_res.io_cells]
-            )
-            key = (a, b)
-            if key in seen_pairs:
-                continue
-            seen_pairs.add(key)
-            for cell in antline_path(a, b):
-                placements.append(Placement(cell, f"{NS}:antline"))
-    return placements
-
-
-
-def write_datapack(out_dir, voxels, entity_results, io_edges):
+def write_datapack(out_dir, voxels, entity_results):
     fn_dir = out_dir / "data" / "bsp2mc" / "functions"
     fn_dir.mkdir(parents=True, exist_ok=True)
 
@@ -756,8 +628,6 @@ def write_datapack(out_dir, voxels, entity_results, io_edges):
     for ent, res in entity_results:
         for p in res.placements:
             (summon_lines if p.summon else entity_lines).append(p.command())
-    for p in generate_antlines(entity_results, io_edges):
-        entity_lines.append(p.command())
     (fn_dir / "build_entities.mcfunction").write_text("\n".join(entity_lines) + "\n")
     build_calls.append(f"execute at {ANCHOR_SELECTOR} run function bsp2mc:build_entities")
 
@@ -805,13 +675,9 @@ def main():
     entity_results = collect_entities(bsp, voxels)
     print(f"  {len(entity_results)} entities placed")
 
-    print("Resolving button/door/fizzler I/O ...")
-    io_edges = resolve_io(bsp, entity_results)
-    print(f"  {len(io_edges)} I/O edges resolved")
-
     out_dir = HERE / f"{bsp_path.stem}_datapack"
     print(f"Writing datapack to {out_dir} ...")
-    write_datapack(out_dir, voxels, entity_results, io_edges)
+    write_datapack(out_dir, voxels, entity_results)
 
     print("Done. Copy the datapack folder into your world's `datapacks/` folder, run")
     print("`/reload`, then stand where you want the chamber and run:")
